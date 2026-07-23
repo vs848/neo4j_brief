@@ -142,3 +142,129 @@ Everything you need for a brief-augmentation layer is already in the graph:
 - Add your own Cypher for whitespace analysis, e.g. keywords *no* competitor tags.
 
 That layer is intentionally not built here for later
+
+## Example Cypher queries
+
+Paste these into Neo4j Browser (Neo4j Desktop) to explore the graph. A larger set of analytic queries (positioning maps, whitespace, media footprint, evidence retrieval, cross-brand overlap) lives in [QUERIES.md](QUERIES.md).
+
+### 1. Seed a tiny sample (so the rest returns rows)
+
+```cypher
+MERGE (b:Brand {slug: 'heineken'})
+  SET b.name = 'Heineken'
+
+MERGE (c:Competitor {domain: 'carlsberg.com'})
+  SET c.name = 'Carlsberg',
+      c.homepage = 'https://www.carlsberg.com',
+      c.description = 'Danish multinational brewer.'
+
+MERGE (b)-[:COMPETES_WITH]->(c)
+
+MERGE (d:Document {url: 'https://www.carlsberg.com/about'})
+  SET d.title = 'About Carlsberg',
+      d.content_hash = 'abc123'
+
+MERGE (c)-[:HAS_DOCUMENT]->(d)
+
+MERGE (ch:Chunk {id: 'abc123::0'})
+  SET ch.position = 0,
+      ch.text = 'Carlsberg Group is a Danish multinational brewer founded in 1847.'
+
+MERGE (d)-[:HAS_CHUNK]->(ch)
+
+MERGE (k:Keyword {term: 'lager'})
+MERGE (c)-[r:TAGGED_WITH]->(k)
+  SET r.score = 0.87;
+```
+
+### 2. Top competitors for a brand, with keyword tags
+
+```cypher
+MATCH (b:Brand {slug: 'heineken'})-[:COMPETES_WITH]->(c:Competitor)
+OPTIONAL MATCH (c)-[t:TAGGED_WITH]->(k:Keyword)
+RETURN c.name       AS competitor,
+       c.domain     AS domain,
+       collect({term: k.term, score: t.score}) AS keywords
+ORDER BY competitor;
+```
+
+### 3. Full path from a brand down to chunks (great for the graph view)
+
+```cypher
+MATCH p = (b:Brand {slug: 'heineken'})
+          -[:COMPETES_WITH]->(:Competitor)
+          -[:HAS_DOCUMENT]->(:Document)
+          -[:HAS_CHUNK]->(:Chunk)
+RETURN p
+LIMIT 25;
+```
+
+> All queries below are scoped to a single brand via `{slug: 'heineken'}` — swap in `'nike'` (or any other brand slug) to switch context. The database can hold many brands side by side; `:Keyword` / `:Theme` / `:Sponsorship` / etc. nodes are shared across brands intentionally, so always filter by `:Brand` when you want a per-brand view.
+
+### 4. Find competitors of one brand that share a keyword (overlap analysis)
+
+```cypher
+MATCH (b:Brand {slug: 'heineken'})-[:COMPETES_WITH]->(c1:Competitor)
+      -[:TAGGED_WITH]->(k:Keyword)<-[:TAGGED_WITH]-
+      (c2:Competitor)<-[:COMPETES_WITH]-(b)
+WHERE c1.domain < c2.domain
+RETURN k.term  AS shared_keyword,
+       c1.name AS competitor_a,
+       c2.name AS competitor_b
+ORDER BY shared_keyword;
+```
+
+### 5. Keyword frequency across one brand's competitor set
+
+```cypher
+MATCH (:Brand {slug: 'heineken'})-[:COMPETES_WITH]->(c:Competitor)
+      -[t:TAGGED_WITH]->(k:Keyword)
+RETURN k.term                 AS term,
+       count(DISTINCT c)      AS competitor_count,
+       round(avg(t.score), 3) AS avg_score
+ORDER BY competitor_count DESC, avg_score DESC
+LIMIT 20;
+```
+
+### 6. Simple keyword search inside chunk text (scoped to one brand)
+
+```cypher
+MATCH (:Brand {slug: 'heineken'})-[:COMPETES_WITH]->(c:Competitor)
+      -[:HAS_DOCUMENT]->(d:Document)-[:HAS_CHUNK]->(ch:Chunk)
+WHERE toLower(ch.text) CONTAINS 'brewer'
+RETURN c.name AS competitor,
+       d.url  AS document,
+       ch.position,
+       substring(ch.text, 0, 160) AS snippet
+ORDER BY competitor, ch.position
+LIMIT 20;
+```
+
+### 7. Housekeeping — counts per label for one brand
+
+```cypher
+MATCH (b:Brand {slug: 'heineken'})
+OPTIONAL MATCH (b)-[:COMPETES_WITH]->(c:Competitor)
+OPTIONAL MATCH (c)-[:HAS_DOCUMENT]->(d:Document)
+OPTIONAL MATCH (d)-[:HAS_CHUNK]->(ch:Chunk)
+OPTIONAL MATCH (c)-[:TAGGED_WITH]->(k:Keyword)
+RETURN count(DISTINCT b)  AS brands,
+       count(DISTINCT c)  AS competitors,
+       count(DISTINCT d)  AS documents,
+       count(DISTINCT ch) AS chunks,
+       count(DISTINCT k)  AS keywords;
+```
+
+### 8. Cross-brand overlap (deliberately mixing brands)
+
+Use this only when you *want* to compare brands — e.g. which themes both Heineken's and Nike's competitor sets converge on.
+
+```cypher
+MATCH (b:Brand)-[:COMPETES_WITH]->(:Competitor)-[:TAGGED_WITH]->(k:Keyword)
+WITH k, collect(DISTINCT b.slug) AS brands
+WHERE size(brands) > 1
+RETURN k.term AS term, brands
+ORDER BY term;
+```
+
+> Tip: in Neo4j Browser, after query #3 click any node and hit the graph icon to expand — you'll see the full `Brand → Competitor → Document → Chunk` chain plus the `Keyword` tags branching off.
