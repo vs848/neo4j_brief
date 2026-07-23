@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "brandgraph"
+version = "0.1.0"
+description = "Scrape competitor data for a brand and build a Neo4j knowledge graph to augment briefs."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "brandgraph" }]
+dependencies = [
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "trafilatura>=1.12",
+    "ddgs>=9.0",
+    "neo4j>=5.20",
+    "typer>=0.12",
+    "rich>=13.7",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "python-dotenv>=1.0",
+    "tldextract>=5.1",
+    "scikit-learn>=1.5",
+    "tenacity>=8.3",
+    "pyvis>=0.3.2",
+]
+
+[project.scripts]
+brandgraph = "brandgraph.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/brandgraph"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/brandgraph", "README.md", "pyproject.toml"]
