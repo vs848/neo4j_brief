@@ -12,6 +12,7 @@ from rich.table import Table
 
 from .graph import GraphStore
 from .pipeline import run_ingest
+from .price_scraper import PriceScraper
 from .taxonomies import TAG_SPECS, TaggingEngine, build_taxonomy
 from .utils import slugify
 from .visualize import render_html
@@ -245,6 +246,160 @@ def init_schema() -> None:
     with GraphStore() as store:
         store.ensure_schema()
     console.print("[green]Schema ensured.[/]")
+
+
+@app.command()
+def prices(
+    brand: str = typer.Argument(..., help="Brand name (must already be ingested)."),
+    extra_urls: Optional[str] = typer.Option(
+        None,
+        "--extra-urls",
+        help=(
+            "Comma-separated additional URLs to scrape for prices (e.g. retailer "
+            "product pages). Useful when competitors don't publish JSON-LD on "
+            "their own domain."
+        ),
+    ),
+    verbose: bool = typer.Option(False, "-v", "--verbose"),
+) -> None:
+    """
+    Extract ``schema.org`` ``Product`` markup from every stored document for
+    ``brand`` and attach ``(:Product)-[:PRICED_AT]->(:PricePoint)`` chains.
+
+    Re-runs are safe: existing products are updated, price observations are
+    appended (so you get history over time).
+    """
+    _setup_logging(verbose)
+    slug = slugify(brand)
+
+    total_products = 0
+    total_price_points = 0
+    pages_scanned = 0
+    extra = [u.strip() for u in extra_urls.split(",")] if extra_urls else []
+
+    with GraphStore() as store:
+        store.ensure_schema()
+        doc_rows = store.document_urls_for_brand(slug)
+        if not doc_rows and not extra:
+            console.print(
+                f"[yellow]No documents found for '{brand}'. Run `ingest` first, "
+                "or pass --extra-urls.[/]"
+            )
+            raise typer.Exit(code=1)
+
+        with PriceScraper() as scraper:
+            # 1. re-scan every stored competitor document for JSON-LD Product data
+            for row in doc_rows:
+                url = str(row["url"])
+                competitor_domain = str(row["competitor_domain"])
+                pairs = scraper.extract(url, competitor_domain=competitor_domain)
+                pages_scanned += 1
+                if not pairs:
+                    continue
+                seen_products: set[str] = set()
+                for product, price_point in pairs:
+                    if product.id not in seen_products:
+                        store.upsert_product(product)
+                        seen_products.add(product.id)
+                        total_products += 1
+                    store.upsert_price_point(price_point)
+                    total_price_points += 1
+                console.print(
+                    f"[cyan]{competitor_domain}[/]  {url}  "
+                    f"products={len(seen_products)} prices={len(pairs)}"
+                )
+
+            # 2. optional extra URLs — the caller decides which competitor they map to
+            #    by prefixing the URL with 'domain=' (e.g. 'carlsberg.com=https://...').
+            for entry in extra:
+                if "=" not in entry:
+                    console.print(
+                        f"[red]--extra-urls entry '{entry}' must be "
+                        "'competitor_domain=url'; skipping.[/]"
+                    )
+                    continue
+                competitor_domain, url = entry.split("=", 1)
+                pairs = scraper.extract(url.strip(), competitor_domain=competitor_domain.strip())
+                pages_scanned += 1
+                seen_products = set()
+                for product, price_point in pairs:
+                    if product.id not in seen_products:
+                        store.upsert_product(product)
+                        seen_products.add(product.id)
+                        total_products += 1
+                    store.upsert_price_point(price_point)
+                    total_price_points += 1
+                console.print(
+                    f"[cyan]{competitor_domain}[/]  {url}  "
+                    f"products={len(seen_products)} prices={len(pairs)}"
+                )
+
+    console.print(
+        f"[bold green]Prices ingested[/]  pages={pages_scanned}  "
+        f"products={total_products}  price_points={total_price_points}"
+    )
+
+
+@app.command("price-summary")
+def price_summary_cmd(
+    brand: str = typer.Argument(..., help="Brand name to summarise prices for."),
+) -> None:
+    """Per-competitor min/avg/max of latest observed prices."""
+    slug = slugify(brand)
+    with GraphStore() as store:
+        rows = store.price_summary(slug)
+
+    if not rows:
+        console.print(
+            f"[yellow]No prices found for '{brand}'. Run `brandgraph prices` first.[/]"
+        )
+        raise typer.Exit(code=1)
+
+    table = Table(title=f"Latest-price summary for {brand}")
+    table.add_column("Competitor")
+    table.add_column("Products", justify="right")
+    table.add_column("Min", justify="right")
+    table.add_column("Avg", justify="right")
+    table.add_column("Max", justify="right")
+    table.add_column("Ccy")
+    for r in rows:
+        table.add_row(
+            str(r["competitor"]),
+            str(r["products"]),
+            f"{float(r['min_price']):.2f}",
+            f"{float(r['avg_price']):.2f}",
+            f"{float(r['max_price']):.2f}",
+            str(r["currency"] or ""),
+        )
+    console.print(table)
+
+
+@app.command("price-history")
+def price_history_cmd(
+    sku: str = typer.Argument(..., help="Product SKU to trace."),
+    days: int = typer.Option(90, "--days", help="Look-back window in days."),
+) -> None:
+    """Show every price observation for a SKU across all retailers."""
+    with GraphStore() as store:
+        rows = store.price_history(sku, days=days)
+
+    if not rows:
+        console.print(f"[yellow]No price observations for SKU '{sku}' in the last {days} days.[/]")
+        raise typer.Exit(code=1)
+
+    table = Table(title=f"Price history for {sku} (last {days}d)")
+    table.add_column("Seen at")
+    table.add_column("Retailer")
+    table.add_column("Amount", justify="right")
+    table.add_column("Ccy")
+    for r in rows:
+        table.add_row(
+            str(r["seen_at"]),
+            str(r["retailer"]),
+            f"{float(r['amount']):.2f}",
+            str(r["currency"] or ""),
+        )
+    console.print(table)
 
 
 @app.command()

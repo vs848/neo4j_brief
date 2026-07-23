@@ -171,6 +171,177 @@ ORDER BY size(brands) DESC, theme;
 
 ---
 
+## Price-tier analysis
+
+> `:PriceTier` is a **positioning tier**, not a currency value — it comes
+> from regex matches on words like `premium`, `mainstream`, `craft`,
+> `super-premium / luxury / prestige` in scraped chunks
+> (see [src/brandgraph/taxonomies.py](src/brandgraph/taxonomies.py)).
+> `mentions` on `:AT_PRICE_TIER` = how loudly a competitor positions itself
+> in that tier, not a dollar amount.
+
+### 11. Price-tier landscape for one brand
+
+```cypher
+MATCH (:Brand {slug:'heineken'})-[:COMPETES_WITH]->(c:Competitor)
+      -[r:AT_PRICE_TIER]->(pt:PriceTier)
+RETURN pt.name AS price_tier,
+       count(DISTINCT c)        AS competitors,
+       sum(r.mentions)          AS total_mentions,
+       collect(DISTINCT c.name) AS who
+ORDER BY competitors DESC, total_mentions DESC;
+```
+
+### 12. Each competitor's primary (loudest) tier
+
+```cypher
+MATCH (:Brand {slug:'heineken'})-[:COMPETES_WITH]->(c:Competitor)
+      -[r:AT_PRICE_TIER]->(pt:PriceTier)
+WITH c, pt, r.mentions AS m
+ORDER BY c.name, m DESC
+WITH c, collect({tier: pt.name, mentions: m}) AS tiers
+RETURN c.name AS competitor,
+       tiers[0].tier     AS primary_tier,
+       tiers[0].mentions AS primary_mentions,
+       tiers             AS all_tiers;
+```
+
+### 13. Price-tier × Category positioning matrix
+
+```cypher
+MATCH (:Brand {slug:'heineken'})-[:COMPETES_WITH]->(c:Competitor)
+      -[:AT_PRICE_TIER]->(pt:PriceTier),
+      (c)-[:IN_CATEGORY]->(cat:Category)
+RETURN cat.name AS category,
+       pt.name  AS price_tier,
+       count(DISTINCT c)        AS competitors,
+       collect(DISTINCT c.name) AS who
+ORDER BY category, competitors DESC;
+```
+
+### 14. Whitespace — tiers nobody in the set is playing in
+
+```cypher
+MATCH (pt:PriceTier)
+WHERE NOT EXISTS {
+  MATCH (:Brand {slug:'heineken'})-[:COMPETES_WITH]->(:Competitor)-[:AT_PRICE_TIER]->(pt)
+}
+RETURN pt.name AS unoccupied_tier;
+```
+
+### 15. Direct price competitors (same tier as your brand's dominant tier)
+
+Swap `'premium'` for whichever tier you want to inspect.
+
+```cypher
+MATCH (:Brand {slug:'heineken'})-[:COMPETES_WITH]->(c:Competitor)
+      -[r:AT_PRICE_TIER]->(:PriceTier {name:'premium'})
+RETURN c.name AS competitor,
+       c.domain,
+       r.mentions AS premium_signal
+ORDER BY premium_signal DESC;
+```
+
+### 16. Evidence — actual sentences a competitor uses to claim a tier
+
+```cypher
+MATCH (c:Competitor {domain:'carlsberg.com'})
+      -[:HAS_DOCUMENT]->(d:Document)-[:HAS_CHUNK]->(ch:Chunk)
+WHERE toLower(ch.text) =~ '.*\\b(super[- ]?premium|luxury|prestige)\\b.*'
+RETURN d.url,
+       substring(ch.text, 0, 220) AS snippet
+LIMIT 10;
+```
+
+---
+
+## Product & PricePoint (real prices)
+
+Populated by `brandgraph prices <brand>`, which parses `schema.org` `Product`
+markup out of every stored page and appends a `:PricePoint` observation per
+scrape.
+
+### 17. Latest price per product / retailer, for one brand
+
+```cypher
+MATCH (:Brand {slug:'heineken'})-[:COMPETES_WITH]->(c:Competitor)
+      -[:SELLS]->(p:Product)-[:PRICED_AT]->(pp:PricePoint)-[:AT_RETAILER]->(r:Retailer)
+WITH c, p, r, pp
+ORDER BY pp.seen_at DESC
+WITH c, p, r, head(collect(pp)) AS latest
+RETURN c.name       AS competitor,
+       p.name       AS product,
+       p.sku        AS sku,
+       r.domain     AS retailer,
+       latest.amount   AS amount,
+       latest.currency AS currency,
+       latest.seen_at  AS seen_at
+ORDER BY competitor, product, retailer;
+```
+
+### 18. Price band per category (latest observations only)
+
+```cypher
+MATCH (:Brand {slug:'heineken'})-[:COMPETES_WITH]->(c:Competitor)
+      -[:SELLS]->(p:Product)-[:PRICED_AT]->(pp:PricePoint)
+WITH c, p, pp ORDER BY pp.seen_at DESC
+WITH c, p, head(collect(pp)) AS latest
+MATCH (c)-[:IN_CATEGORY]->(cat:Category)
+RETURN cat.name AS category,
+       min(latest.amount) AS min_price,
+       avg(latest.amount) AS avg_price,
+       max(latest.amount) AS max_price,
+       latest.currency    AS currency,
+       count(DISTINCT p)  AS products
+ORDER BY avg_price DESC;
+```
+
+### 19. Cheapest retailer for a specific SKU right now
+
+```cypher
+MATCH (p:Product {sku:'HNK-330-6PK'})-[:PRICED_AT]->(pp:PricePoint)-[:AT_RETAILER]->(r:Retailer)
+WITH r, pp ORDER BY pp.seen_at DESC
+WITH r, head(collect(pp)) AS latest
+RETURN r.name        AS retailer,
+       latest.amount AS amount,
+       latest.currency,
+       latest.seen_at
+ORDER BY latest.amount ASC;
+```
+
+### 20. Price movement over the last 90 days per competitor
+
+```cypher
+MATCH (c:Competitor)-[:SELLS]->(p:Product)-[:PRICED_AT]->(pp:PricePoint)
+WHERE pp.seen_at >= datetime() - duration('P90D')
+RETURN c.name  AS competitor,
+       p.name  AS product,
+       min(pp.amount) AS low,
+       max(pp.amount) AS high,
+       max(pp.amount) - min(pp.amount) AS spread,
+       count(pp) AS observations
+ORDER BY spread DESC
+LIMIT 20;
+```
+
+### 21. Positioning tier vs. actual median price (sanity-check the taxonomy)
+
+Where the tagger says "premium" but real prices are cheap → the taxonomy needs
+tuning, or the competitor is using the word aspirationally.
+
+```cypher
+MATCH (:Brand {slug:'heineken'})-[:COMPETES_WITH]->(c:Competitor)
+      -[:AT_PRICE_TIER]->(pt:PriceTier),
+      (c)-[:SELLS]->(:Product)-[:PRICED_AT]->(pp:PricePoint)
+WITH pt.name AS tier, pp.amount AS price
+RETURN tier,
+       percentileCont(price, 0.5) AS median_price,
+       count(price) AS observations
+ORDER BY median_price;
+```
+
+---
+
 ## Bonus — supporting queries
 
 ### Seed a tiny sample (so queries return rows before ingest)

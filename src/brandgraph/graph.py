@@ -3,17 +3,23 @@
 Graph model
 -----------
 Nodes
-    (:Brand      {slug, name, created_at})
-    (:Competitor {slug, name, domain, homepage, description, discovered_at})
-    (:Document   {url, title, content_hash, fetched_at})
-    (:Chunk      {id, position, text})
-    (:Keyword    {term})
+    (:Brand       {slug, name, created_at})
+    (:Competitor  {slug, name, domain, homepage, description, discovered_at})
+    (:Document    {url, title, content_hash, fetched_at})
+    (:Chunk       {id, position, text})
+    (:Keyword     {term})
+    (:Product     {id, sku, name, size, variant, abv, url})
+    (:PricePoint  {id, currency, amount, market, seen_at})
+    (:Retailer    {domain, name})
 
 Relationships
     (:Brand)-[:COMPETES_WITH]->(:Competitor)
     (:Competitor)-[:HAS_DOCUMENT]->(:Document)
     (:Document)-[:HAS_CHUNK]->(:Chunk)
     (:Competitor)-[:TAGGED_WITH {score}]->(:Keyword)
+    (:Competitor)-[:SELLS]->(:Product)
+    (:Product)-[:PRICED_AT]->(:PricePoint)
+    (:PricePoint)-[:AT_RETAILER]->(:Retailer)
 """
 from __future__ import annotations
 
@@ -23,7 +29,7 @@ from typing import Iterable
 from neo4j import Driver, GraphDatabase
 
 from .config import settings
-from .models import Brand, Chunk, Competitor, Document, KeywordScore
+from .models import Brand, Chunk, Competitor, Document, KeywordScore, PricePoint, Product
 from .taxonomies import TAG_SPECS, TagHits
 
 log = logging.getLogger(__name__)
@@ -44,6 +50,10 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE CONSTRAINT document_url IF NOT EXISTS FOR (d:Document) REQUIRE d.url IS UNIQUE",
     "CREATE CONSTRAINT chunk_id IF NOT EXISTS FOR (ch:Chunk) REQUIRE ch.id IS UNIQUE",
     "CREATE CONSTRAINT keyword_term IF NOT EXISTS FOR (k:Keyword) REQUIRE k.term IS UNIQUE",
+    "CREATE CONSTRAINT product_id IF NOT EXISTS FOR (p:Product) REQUIRE p.id IS UNIQUE",
+    "CREATE CONSTRAINT retailer_domain IF NOT EXISTS FOR (r:Retailer) REQUIRE r.domain IS UNIQUE",
+    "CREATE CONSTRAINT price_point_id IF NOT EXISTS FOR (pp:PricePoint) REQUIRE pp.id IS UNIQUE",
+    "CREATE INDEX price_point_seen_at IF NOT EXISTS FOR (pp:PricePoint) ON (pp.seen_at)",
     "CREATE FULLTEXT INDEX chunk_text IF NOT EXISTS FOR (ch:Chunk) ON EACH [ch.text]",
 ) + _tag_constraints()
 
@@ -81,8 +91,12 @@ class GraphStore:
         OPTIONAL MATCH (b)-[:COMPETES_WITH]->(c:Competitor)
         OPTIONAL MATCH (c)-[:HAS_DOCUMENT]->(d:Document)
         OPTIONAL MATCH (d)-[:HAS_CHUNK]->(ch:Chunk)
-        DETACH DELETE ch, d, c, b
+        OPTIONAL MATCH (c)-[:SELLS]->(p:Product)
+        OPTIONAL MATCH (p)-[:PRICED_AT]->(pp:PricePoint)
+        DETACH DELETE pp, p, ch, d, c, b
         """
+        with self._driver.session(database=self._db) as session:
+            session.run(cypher, slug=brand_slug)
         with self._driver.session(database=self._db) as session:
             session.run(cypher, slug=brand_slug)
 
@@ -208,6 +222,66 @@ class GraphStore:
             written += len(rows)
         return written
 
+    def upsert_product(self, product: Product) -> None:
+        """Upsert a ``:Product`` and attach it to its competitor via ``:SELLS``."""
+        cypher = """
+        MERGE (p:Product {id: $id})
+        SET p.sku = $sku,
+            p.name = $name,
+            p.size = $size,
+            p.variant = $variant,
+            p.abv = $abv,
+            p.url = $url
+        WITH p
+        MATCH (c:Competitor {domain: $competitor_domain})
+        MERGE (c)-[:SELLS]->(p)
+        """
+        with self._driver.session(database=self._db) as session:
+            session.run(
+                cypher,
+                id=product.id,
+                sku=product.sku,
+                name=product.name,
+                size=product.size,
+                variant=product.variant,
+                abv=product.abv,
+                url=str(product.url) if product.url else None,
+                competitor_domain=product.competitor_domain,
+            )
+
+    def upsert_price_point(self, pp: PricePoint) -> None:
+        """
+        Append a ``:PricePoint`` observation for a ``:Product`` at a retailer.
+
+        Idempotent per ``(product, retailer, seen_at)`` — re-running the same
+        scrape within the same second is a no-op; a later scrape adds a new
+        point, preserving history.
+        """
+        cypher = """
+        MERGE (r:Retailer {domain: $retailer_domain})
+          ON CREATE SET r.name = $retailer_domain
+        MERGE (pp:PricePoint {id: $id})
+          ON CREATE SET pp.currency = $currency,
+                        pp.amount   = $amount,
+                        pp.market   = $market,
+                        pp.seen_at  = datetime($seen_at)
+        WITH pp, r
+        MATCH (p:Product {id: $product_id})
+        MERGE (p)-[:PRICED_AT]->(pp)
+        MERGE (pp)-[:AT_RETAILER]->(r)
+        """
+        with self._driver.session(database=self._db) as session:
+            session.run(
+                cypher,
+                id=pp.id,
+                product_id=pp.product_id,
+                retailer_domain=pp.retailer_domain,
+                currency=pp.currency,
+                amount=pp.amount,
+                market=pp.market,
+                seen_at=pp.seen_at.isoformat(),
+            )
+
     # ---- reads --------------------------------------------------------------
 
     def list_competitors(self, brand_slug: str) -> list[dict[str, object]]:
@@ -310,3 +384,76 @@ class GraphStore:
         with self._driver.session(database=self._db) as session:
             result = session.run(cypher, q=query, limit=limit)
             return [dict(record) for record in result]
+
+    # ---- product / price reads ---------------------------------------------
+
+    def document_urls_for_brand(self, brand_slug: str) -> list[dict[str, str]]:
+        """Return ``[{competitor_domain, url}]`` for every stored document."""
+        cypher = """
+        MATCH (:Brand {slug: $slug})-[:COMPETES_WITH]->(c:Competitor)
+              -[:HAS_DOCUMENT]->(d:Document)
+        RETURN c.domain AS competitor_domain, d.url AS url
+        ORDER BY competitor_domain, url
+        """
+        with self._driver.session(database=self._db) as session:
+            result = session.run(cypher, slug=brand_slug)
+            return [dict(r) for r in result]
+
+    def latest_prices(self, brand_slug: str, limit: int = 100) -> list[dict[str, object]]:
+        """Latest price per (product, retailer) pair for a brand's competitor set."""
+        cypher = """
+        MATCH (:Brand {slug: $slug})-[:COMPETES_WITH]->(c:Competitor)
+              -[:SELLS]->(p:Product)-[:PRICED_AT]->(pp:PricePoint)
+              -[:AT_RETAILER]->(r:Retailer)
+        WITH c, p, r, pp
+        ORDER BY pp.seen_at DESC
+        WITH c, p, r, head(collect(pp)) AS latest
+        RETURN c.name       AS competitor,
+               p.name       AS product,
+               p.sku        AS sku,
+               p.size       AS size,
+               r.domain     AS retailer,
+               latest.amount   AS amount,
+               latest.currency AS currency,
+               latest.seen_at  AS seen_at
+        ORDER BY competitor, product, retailer
+        LIMIT $limit
+        """
+        with self._driver.session(database=self._db) as session:
+            result = session.run(cypher, slug=brand_slug, limit=limit)
+            return [dict(r) for r in result]
+
+    def price_summary(self, brand_slug: str) -> list[dict[str, object]]:
+        """Per-competitor price stats (min/avg/max of latest observed prices)."""
+        cypher = """
+        MATCH (:Brand {slug: $slug})-[:COMPETES_WITH]->(c:Competitor)
+              -[:SELLS]->(p:Product)-[:PRICED_AT]->(pp:PricePoint)
+        WITH c, p, pp
+        ORDER BY pp.seen_at DESC
+        WITH c, p, head(collect(pp)) AS latest
+        RETURN c.name              AS competitor,
+               count(DISTINCT p)   AS products,
+               min(latest.amount)  AS min_price,
+               avg(latest.amount)  AS avg_price,
+               max(latest.amount)  AS max_price,
+               latest.currency     AS currency
+        ORDER BY avg_price DESC
+        """
+        with self._driver.session(database=self._db) as session:
+            result = session.run(cypher, slug=brand_slug)
+            return [dict(r) for r in result]
+
+    def price_history(self, sku: str, days: int = 90) -> list[dict[str, object]]:
+        """Chronological price observations for a SKU across all retailers."""
+        cypher = """
+        MATCH (p:Product {sku: $sku})-[:PRICED_AT]->(pp:PricePoint)-[:AT_RETAILER]->(r:Retailer)
+        WHERE pp.seen_at >= datetime() - duration({days: $days})
+        RETURN r.domain     AS retailer,
+               pp.amount    AS amount,
+               pp.currency  AS currency,
+               pp.seen_at   AS seen_at
+        ORDER BY seen_at ASC, retailer ASC
+        """
+        with self._driver.session(database=self._db) as session:
+            result = session.run(cypher, sku=sku, days=days)
+            return [dict(r) for r in result]

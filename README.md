@@ -31,6 +31,15 @@ Typed layer (from `tag`, adds structured media-analytic entities):
 ```
 All typed edges carry a ``mentions`` weight so you can rank confidence.
 
+Product / price layer (from `prices`, extracts schema.org `Product` markup):
+```
+(:Competitor) -[:SELLS]->     (:Product {id, sku, name, size, variant, abv, url})
+                -[:PRICED_AT]-> (:PricePoint {currency, amount, market, seen_at})
+                                  -[:AT_RETAILER]-> (:Retailer {domain, name})
+```
+`:PricePoint` is append-only, so re-running `prices` builds a price-history
+series per SKU/retailer.
+
 A full-text index on `Chunk.text` powers ad-hoc retrieval for later brief augmentation.
 
 ## Setup
@@ -86,6 +95,19 @@ brandgraph tag-types                       # list all tag types + samples
 
 # Full-text search across every stored chunk
 brandgraph search "sustainability messaging" -n 5
+
+# 3. Prices: extract schema.org Product data from every stored page and
+#    build (:Product)-[:PRICED_AT]->(:PricePoint) chains. Re-run any time to
+#    append new price observations (append-only, so you get history).
+brandgraph prices "Heineken"
+
+# Optional: also scrape specific retailer URLs (format: 'competitor_domain=url')
+brandgraph prices "Heineken" \
+  --extra-urls "carlsberg.com=https://retailer.example/p/carlsberg-6pk,heineken.com=https://retailer.example/p/heineken-0-0"
+
+# Report latest prices
+brandgraph price-summary "Heineken"
+brandgraph price-history "HNK-330-6PK" --days 90
 
 # Wipe and re-ingest
 brandgraph ingest "Heineken" --seed-domain heineken.com --reset
